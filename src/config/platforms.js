@@ -30,7 +30,7 @@ export const PLATFORMS = {
   arch: 'https://geo.mirror.pkgbuild.com',
   arxiv: 'https://arxiv.org',
   fdroid: 'https://f-droid.org',
-	dockerhub: 'https://registry-1.docker.io',
+
 
   // Container Registries
   'cr-quay': 'https://quay.io',
@@ -48,7 +48,8 @@ export const PLATFORMS = {
   'cr-heroku': 'https://registry.heroku.com',
   'cr-suse': 'https://registry.suse.com',
   'cr-opensuse': 'https://registry.opensuse.org',
-  'cr-gitpod': 'https://registry.gitpod.io'
+  'cr-gitpod': 'https://registry.gitpod.io',
+  'cr-dockerhub': 'https://registry-1.docker.io',
 };
 
 /**
