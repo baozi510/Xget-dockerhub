@@ -1,0 +1,15 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "hxorz"
+main = "src/index.js"
+compatibility_date = "2025-08-04"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+routes = [
+  "hxorz.cn/*",
+  "*.hxorz.cn/*",
+]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
