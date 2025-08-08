@@ -153,9 +153,19 @@ function isMirrorDockerPath(pathname) {
 
 /** 上游代理（流式转发 + 401 原样透传 + 3xx Location 重写）——仅给 Docker 用 */
 async function proxyDockerUpstream(request, upstreamUrl) {
+  // 组一份“干净”的头部：保留鉴权/接受类型，剔除 Host/Connection/TE 等可能引发问题的头
+  const fwd = new Headers();
+  for (const [k, v] of request.headers.entries()) {
+    const kl = k.toLowerCase();
+    if (['host','connection','proxy-connection','transfer-encoding','content-length','accept-encoding','cf-connecting-ip','x-forwarded-for','x-forwarded-proto'].includes(kl)) continue;
+    fwd.set(k, v);
+  }
+  // 缺省 UA（有些上游在无 UA 时会怪）
+  if (!fwd.has('User-Agent')) fwd.set('User-Agent', 'docker/24 proxy');
+
   const upstream = await fetch(upstreamUrl, {
     method: request.method,
-    headers: request.headers,
+    headers: fwd,
     body: (request.method === 'GET' || request.method === 'HEAD') ? undefined : request.body,
     redirect: 'manual'
   });
@@ -185,6 +195,7 @@ async function proxyDockerUpstream(request, upstreamUrl) {
   // 3) 其余：保持原样、流式转发（不额外加头，协议更干净）
   return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
 }
+
 
 /**
  * Parses WWW-Authenticate header for container registry
