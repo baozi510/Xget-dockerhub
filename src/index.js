@@ -153,14 +153,18 @@ function isMirrorDockerPath(pathname) {
 
 /** 上游代理（流式转发 + 401 原样透传 + 3xx Location 重写）——仅给 Docker 用 */
 async function proxyDockerUpstream(request, upstreamUrl) {
-  // 组一份“干净”的头部：保留鉴权/接受类型，剔除 Host/Connection/TE 等可能引发问题的头
+  // 组一份“干净”的头部：保留必要头，剔除可能干扰上游鉴权/路由的头
   const fwd = new Headers();
   for (const [k, v] of request.headers.entries()) {
     const kl = k.toLowerCase();
-    if (['host','connection','proxy-connection','transfer-encoding','content-length','accept-encoding','cf-connecting-ip','x-forwarded-for','x-forwarded-proto'].includes(kl)) continue;
+    if ([
+      'host','connection','proxy-connection','transfer-encoding',
+      'content-length','accept-encoding','cf-connecting-ip',
+      'x-forwarded-for','x-forwarded-proto'
+    ].includes(kl)) continue;
     fwd.set(k, v);
   }
-  // 缺省 UA（有些上游在无 UA 时会怪）
+  // 缺省 UA（部分上游在无 UA 时会表现怪异）
   if (!fwd.has('User-Agent')) fwd.set('User-Agent', 'docker/24 proxy');
 
   const upstream = await fetch(upstreamUrl, {
@@ -170,12 +174,12 @@ async function proxyDockerUpstream(request, upstreamUrl) {
     redirect: 'manual'
   });
 
-  // 1) 401：原样透传挑战头，让客户端自己去 auth.docker.io
+  // 1) 401：原样透传挑战头（含 WWW-Authenticate），让 Docker 自取 token
   if (upstream.status === 401) {
     return new Response(upstream.body, { status: 401, headers: upstream.headers });
   }
 
-  // 2) 3xx：把 registry-1 的 Location 改回你的域名，阻止跳出镜像
+  // 2) 3xx：把指向 registry-1 的 Location 改回当前域名（防止跳出镜像）
   if (upstream.status >= 300 && upstream.status < 400) {
     const loc = upstream.headers.get('Location');
     if (loc) {
@@ -183,7 +187,7 @@ async function proxyDockerUpstream(request, upstreamUrl) {
       const u = new URL(loc);
       if (u.hostname === 'registry-1.docker.io') {
         u.protocol = reqUrl.protocol;
-        u.host = reqUrl.host; // 回写成 hxorz.cn
+        u.host = reqUrl.host; // hxorz.cn
         const h = new Headers(upstream.headers);
         h.set('Location', u.toString());
         return new Response(null, { status: upstream.status, headers: h });
@@ -192,10 +196,9 @@ async function proxyDockerUpstream(request, upstreamUrl) {
     return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
   }
 
-  // 3) 其余：保持原样、流式转发（不额外加头，协议更干净）
+  // 3) 其余：保持原样、流式转发（不附加额外安全头，协议更干净）
   return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
 }
-
 
 /**
  * Parses WWW-Authenticate header for container registry
@@ -283,12 +286,14 @@ async function handleRequest(request, env, ctx) {
 
       // ② 显式模式短路：/v2/cr/dockerhub/<repo>/... 或 /cr/dockerhub/<repo>/...
       if (url.pathname.startsWith('/v2/cr/dockerhub/') || url.pathname.startsWith('/cr/dockerhub/')) {
-        const rewritten = url.pathname
-          .replace(/^\/v2\/cr\/dockerhub\//, '/v2/')
-          .replace(/^\/cr\/dockerhub\//, '/v2/');
-        const upstreamUrl = `https://registry-1.docker.io${rewritten}${url.search}`;
-        return proxyDockerUpstream(request, upstreamUrl);
-      }
+  if (/(\/manifests\/|\/blobs\/|\/tags\/)/.test(url.pathname)) {
+    const rewritten = url.pathname
+      .replace(/^\/v2\/cr\/dockerhub\//, '/v2/')
+      .replace(/^\/cr\/dockerhub\//, '/v2/');
+    const upstreamUrl = `https://registry-1.docker.io${rewritten}${url.search}`;
+    return proxyDockerUpstream(request, upstreamUrl);
+  }
+}
 
       // ③ 其余显式平台：必须带 /cr/ 前缀
       if (!url.pathname.startsWith('/cr/') && !url.pathname.startsWith('/v2/cr/')) {
