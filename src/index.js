@@ -14,8 +14,8 @@ class PerformanceMonitor {
   }
 
   /**
-   * Marks a timing point with the given name
-   * @param {string} name - The name of the timing mark
+   * Records a named performance mark
+   * @param {string} name - The name of the performance mark
    */
   mark(name) {
     if (this.marks.has(name)) {
@@ -25,8 +25,8 @@ class PerformanceMonitor {
   }
 
   /**
-   * Returns all collected metrics
-   * @returns {Object.<string, number>} Object containing name-timestamp pairs
+   * Gets all recorded performance metrics
+   * @returns {Record<string, number>} A dictionary of performance metrics
    */
   getMetrics() {
     return Object.fromEntries(this.marks.entries());
@@ -34,10 +34,10 @@ class PerformanceMonitor {
 }
 
 /**
- * Detects if a request is a container registry operation
+ * Detects if a request is a Docker container registry operation
  * @param {Request} request - The incoming request object
  * @param {URL} url - Parsed URL object
- * @returns {boolean} True if this is a container registry operation
+ * @returns {boolean} True if this is a Docker registry operation
  */
 function isDockerRequest(request, url) {
   // Check for container registry API endpoints
@@ -61,6 +61,12 @@ function isDockerRequest(request, url) {
     return true;
   }
 
+  // Check for Docker-specific Docker-Distribution-Api-Version header
+  const apiVersion = request.headers.get('Docker-Distribution-Api-Version') || '';
+  if (apiVersion.includes('registry/2.0')) {
+    return true;
+  }
+
   return false;
 }
 
@@ -80,16 +86,16 @@ function isGitRequest(request, url) {
     return true;
   }
 
-  // Check for Git user agents (more comprehensive check)
+  // Check for Git user agents (more comprehensive detection)
   const userAgent = request.headers.get('User-Agent') || '';
   if (userAgent.includes('git/') || userAgent.startsWith('git/')) {
     return true;
   }
 
-  // Check for Git-specific query parameters
-  if (url.searchParams.has('service')) {
-    const service = url.searchParams.get('service');
-    return service === 'git-upload-pack' || service === 'git-receive-pack';
+  // Check for Git service parameter often used in info/refs requests
+  const serviceParam = url.searchParams.get('service') || '';
+  if (serviceParam === 'git-upload-pack' || serviceParam === 'git-receive-pack') {
+    return true;
   }
 
   // Check for Git-specific content types
@@ -108,17 +114,16 @@ function isGitRequest(request, url) {
  * @returns {{valid: boolean, error?: string, status?: number}} Validation result
  */
 function validateRequest(request, url) {
-  // Allow POST method for Git and Docker operations
   const isGit = isGitRequest(request, url);
   const isDocker = isDockerRequest(request, url);
 
-  const allowedMethods =
-    isGit || isDocker ? ['GET', 'HEAD', 'POST', 'PUT', 'PATCH'] : CONFIG.SECURITY.ALLOWED_METHODS;
-
+  // Allow only specific methods (more permissive for Git/Docker which need POST/PUT/PATCH)
+  const allowedMethods = isGit || isDocker ? ['GET', 'HEAD', 'POST', 'PUT', 'PATCH'] : CONFIG.SECURITY.ALLOWED_METHODS;
   if (!allowedMethods.includes(request.method)) {
     return { valid: false, error: 'Method not allowed', status: 405 };
   }
 
+  // Validate path length
   if (url.pathname.length > CONFIG.SECURITY.MAX_PATH_LENGTH) {
     return { valid: false, error: 'Path too long', status: 414 };
   }
@@ -129,7 +134,7 @@ function validateRequest(request, url) {
 /**
  * Adds security headers to the response
  * @param {Headers} headers - Headers object to modify
- * @returns {Headers} Modified headers object
+ * @returns {Headers} Modified headers with security policies applied
  */
 function addSecurityHeaders(headers) {
   headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
@@ -141,9 +146,29 @@ function addSecurityHeaders(headers) {
   return headers;
 }
 
+/** 识别 /v2/<repo>/(manifests|blobs|tags) 的镜像模式路径（不以 /v2/cr/ 开头） */
+function isMirrorDockerPath(pathname) {
+  return /^\/v2\/(?!cr\/)(.+?)\/(manifests|blobs|tags)\b/.test(pathname);
+}
+
+/** 上游代理（流式转发 + 401 原样透传）——仅给 Docker 用 */
+async function proxyDockerUpstream(request, upstreamUrl) {
+  const upstream = await fetch(upstreamUrl, {
+    method: request.method,
+    headers: request.headers,
+    body: (request.method === 'GET' || request.method === 'HEAD') ? undefined : request.body,
+    redirect: 'manual'
+  });
+  if (upstream.status === 401) {
+    return new Response(upstream.body, { status: 401, headers: upstream.headers });
+  }
+  const hdrs = addSecurityHeaders(new Headers(upstream.headers));
+  return new Response(upstream.body, { status: upstream.status, headers: hdrs });
+}
+
 /**
- * Parses Docker WWW-Authenticate header
- * @param {string} authenticateStr - The WWW-Authenticate header value
+ * Parses WWW-Authenticate header for container registry
+ * @param {string} authenticateStr - The WWW-Authenticate header string
  * @returns {{realm: string, service: string}} Parsed authentication info
  */
 function parseAuthenticate(authenticateStr) {
@@ -178,30 +203,10 @@ async function fetchToken(wwwAuthenticate, scope, authorization) {
   if (authorization) {
     headers.set('Authorization', authorization);
   }
-  return await fetch(url, { method: 'GET', headers: headers });
+  const resp = await fetch(url.toString(), { headers, redirect: 'follow' });
+  return resp;
 }
 
-/**
- * Creates unauthorized response for container registry
- * @param {URL} url - Request URL
- * @returns {Response} Unauthorized response
- */
-function responseUnauthorized(url) {
-  const headers = new Headers();
-  headers.set('WWW-Authenticate', `Bearer realm="https://${url.hostname}/v2/auth",service="Xget"`);
-  return new Response(JSON.stringify({ message: 'UNAUTHORIZED' }), {
-    status: 401,
-    headers: headers
-  });
-}
-
-/**
- * Handles incoming requests with caching, retries, and security measures
- * @param {Request} request - The incoming request
- * @param {Object} env - Environment variables
- * @param {ExecutionContext} ctx - Cloudflare Workers execution context
- * @returns {Promise<Response>} The response object
- */
 async function handleRequest(request, env, ctx) {
   try {
     const url = new URL(request.url);
@@ -239,27 +244,31 @@ async function handleRequest(request, env, ctx) {
 
     // Handle container registry paths specially
     if (isDocker) {
-      // For Docker requests (excluding version check which is handled above),
-      // check if they have /cr/ prefix
+      // 镜像模式优先：/v2/<repo>/(manifests|blobs|tags) 直接代理 Docker Hub
+      if (isMirrorDockerPath(url.pathname)) {
+        const upstreamUrl = `https://registry-1.docker.io${url.pathname}${url.search}`;
+        return proxyDockerUpstream(request, upstreamUrl);
+      }
+      // 兼容显式模式：必须带 /cr/ 前缀
       if (!url.pathname.startsWith('/cr/') && !url.pathname.startsWith('/v2/cr/')) {
         return new Response('container registry requests must use /cr/ prefix', {
           status: 400,
           headers: addSecurityHeaders(new Headers())
         });
       }
-      // Remove /v2 from the path for container registry API consistency if present
+      // 显式模式下供后续解析的平台路径：移除开头的 /v2
       effectivePath = url.pathname.replace(/^\/v2/, '');
     }
 
     // Platform detection using transform patterns
     // Sort platforms by path length (descending) to prioritize more specific paths
-    // e.g., conda/community should match before conda, pypi/files before pypi
     const sortedPlatforms = Object.keys(CONFIG.PLATFORMS).sort((a, b) => {
       const pathA = `/${a.replace('-', '/')}/`;
       const pathB = `/${b.replace('-', '/')}/`;
       return pathB.length - pathA.length;
     });
 
+    // Try to match the path to a platform using unified logic
     platform =
       sortedPlatforms.find(key => {
         const expectedPrefix = `/${key.replace('-', '/')}/`;
@@ -277,7 +286,7 @@ async function handleRequest(request, env, ctx) {
     // For container registries, ensure we add the /v2 prefix for the Docker API
     let finalTargetPath;
     if (platform.startsWith('cr-')) {
-      finalTargetPath = `/v2${targetPath}`;
+      finalTargetPath = targetPath.startsWith('/v2/') ? targetPath : `/v2${targetPath}`;
     } else {
       finalTargetPath = targetPath;
     }
@@ -321,7 +330,8 @@ async function handleRequest(request, env, ctx) {
       }
     }
 
-    /** @type {RequestInit} */
+    // Prepare fetch options
+    /** @type {RequestInit & {cf?: any}} */
     const fetchOptions = {
       method: request.method,
       headers: new Headers(),
@@ -357,16 +367,18 @@ async function handleRequest(request, env, ctx) {
         if (!requestHeaders.has('Content-Type')) {
           requestHeaders.set('Content-Type', 'application/x-git-upload-pack-request');
         }
+        requestHeaders.set('Accept', 'application/x-git-upload-pack-result');
       }
 
-      // For Git receive-pack requests, ensure proper content type
-      if (isGit && request.method === 'POST' && url.pathname.endsWith('/git-receive-pack')) {
-        if (!requestHeaders.has('Content-Type')) {
-          requestHeaders.set('Content-Type', 'application/x-git-receive-pack-request');
-        }
-      }
+      // Remove encoding headers that might conflict with proxying
+      requestHeaders.delete('Accept-Encoding');
+      requestHeaders.delete('Content-Length');
+      requestHeaders.delete('Transfer-Encoding');
+
+      // Explicitly set connection headers for Git/Docker operations
+      requestHeaders.set('Connection', 'keep-alive');
     } else {
-      // Regular file download headers
+      // Enable Cloudflare optimization for non-Git/Docker requests
       Object.assign(fetchOptions, {
         cf: {
           http3: true,
@@ -381,6 +393,7 @@ async function handleRequest(request, env, ctx) {
         }
       });
 
+      // Set appropriate headers for regular requests to improve caching
       requestHeaders.set('Accept-Encoding', 'gzip, deflate, br');
       requestHeaders.set('Connection', 'keep-alive');
       requestHeaders.set('User-Agent', 'Wget/1.21.3');
@@ -399,11 +412,11 @@ async function handleRequest(request, env, ctx) {
       try {
         monitor.mark('attempt_' + attempts);
 
-        // Fetch with timeout
+        // Create a controller to enforce request timeout
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), CONFIG.TIMEOUT_SECONDS * 1000);
 
-        // For Git/Docker operations, don't use Cloudflare-specific options
+        // Perform the fetch with the signal for timeout support
         const finalFetchOptions =
           isGit || isDocker
             ? { ...fetchOptions, signal: controller.signal }
@@ -418,62 +431,10 @@ async function handleRequest(request, env, ctx) {
           break;
         }
 
-        // For container registry, handle authentication challenges more intelligently
+        // Docker 401：原样透传挑战头，让客户端自行获取 token
         if (isDocker && response.status === 401) {
-          monitor.mark('docker_auth_challenge');
-
-          // For container registries, first check if we can get a token without credentials
-          // This allows access to public repositories
-          const authenticateStr = response.headers.get('WWW-Authenticate');
-          if (authenticateStr) {
-            try {
-              const wwwAuthenticate = parseAuthenticate(authenticateStr);
-
-              // Infer scope from the request path for container registry requests
-              let scope = '';
-              const pathParts = url.pathname.split('/');
-              if (pathParts.length >= 4 && pathParts[1] === 'v2') {
-                // Extract repository name from path like /v2/cr/ghcr/nginxinc/nginx-unprivileged/manifests/latest
-                // Remove /v2 and platform prefix to get the repo path
-                const repoPath = pathParts.slice(4).join('/'); // Skip /v2/cr/[registry]
-                const repoParts = repoPath.split('/');
-                if (repoParts.length >= 1) {
-                  const repoName = repoParts.slice(0, -2).join('/'); // Remove /manifests/tag or /blobs/sha
-                  if (repoName) {
-                    scope = `repository:${repoName}:pull`;
-                  }
-                }
-              }
-
-              // Try to get a token for public access (without authorization)
-              const tokenResponse = await fetchToken(wwwAuthenticate, scope || '', '');
-              if (tokenResponse.ok) {
-                const tokenData = await tokenResponse.json();
-                if (tokenData.token) {
-                  // Retry the original request with the obtained token
-                  const retryHeaders = new Headers(requestHeaders);
-                  retryHeaders.set('Authorization', `Bearer ${tokenData.token}`);
-
-                  const retryResponse = await fetch(targetUrl, {
-                    ...finalFetchOptions,
-                    headers: retryHeaders
-                  });
-
-                  if (retryResponse.ok) {
-                    response = retryResponse;
-                    monitor.mark('success');
-                    break;
-                  }
-                }
-              }
-            } catch (error) {
-              console.log('Token fetch failed:', error);
-            }
-          }
-
-          // If token fetch failed or didn't work, return the unauthorized response
-          // Only return this if we truly can't access the resource
-          return responseUnauthorized(url);
+          monitor.mark('docker_auth_passthrough');
+          return new Response(response.body, { status: 401, headers: response.headers });
         }
 
         // Don't retry on client errors (4xx) - these won't improve with retries
@@ -521,7 +482,7 @@ async function handleRequest(request, env, ctx) {
       if (isDocker && response.status === 401) {
         const errorText = await response.text().catch(() => '');
         return new Response(
-          `Authentication required for this container registry resource. This may be a private repository. Original error: ${errorText}`,
+          `Authentication required for this container registry request. This may be a private repository. Original error: ${errorText}`,
           {
             status: 401,
             headers: addSecurityHeaders(new Headers())
@@ -538,9 +499,10 @@ async function handleRequest(request, env, ctx) {
     // Handle URL rewriting for different platforms
     let responseBody = response.body;
 
-    // Handle PyPI simple index URL rewriting
+    // Handle PyPI index rewriting
     if (platform === 'pypi' && response.headers.get('content-type')?.includes('text/html')) {
       const originalText = await response.text();
+
       // Rewrite URLs in the response body to go through the Cloudflare Worker
       // files.pythonhosted.org URLs should be rewritten to go through our pypi/files endpoint
       const rewrittenText = originalText.replace(
@@ -571,7 +533,7 @@ async function handleRequest(request, env, ctx) {
       // Don't add any additional headers that might interfere with protocol operation
       // The response headers from upstream should be passed through as-is
     } else {
-      // Regular file download headers
+      // For regular requests, add security and caching headers
       headers.set('Cache-Control', `public, max-age=${CONFIG.CACHE_DURATION}`);
       headers.set('X-Content-Type-Options', 'nosniff');
       headers.set('Accept-Ranges', 'bytes');
@@ -581,16 +543,23 @@ async function handleRequest(request, env, ctx) {
     // Create final response
     const finalResponse = new Response(responseBody, {
       status: response.status,
-      headers: headers
+      headers
     });
 
-    // Cache successful responses (skip caching for Git and Docker operations)
+    // Cache successful responses for non-Git/Docker requests
     if (!isGit && !isDocker && (response.ok || response.status === 206)) {
       ctx.waitUntil(cache.put(cacheKey, finalResponse.clone()));
     }
 
     monitor.mark('complete');
-    return isGit || isDocker ? finalResponse : addPerformanceHeaders(finalResponse, monitor);
+
+    // For Git/Docker operations, return response directly
+    if (isGit || isDocker) {
+      return finalResponse;
+    }
+
+    // For regular requests, add performance metrics header
+    return addPerformanceHeaders(finalResponse, monitor);
   } catch (error) {
     console.error('Error handling request:', error);
     const message = error instanceof Error ? error.message : String(error);
@@ -602,19 +571,16 @@ async function handleRequest(request, env, ctx) {
 }
 
 /**
- * Adds performance metrics to response headers
- * @param {Response} response - The response object
- * @param {PerformanceMonitor} monitor - Performance monitor instance
- * @returns {Response} New response with performance headers
+ * Adds performance metrics to the response headers
+ * @param {Response} response - The response object to modify
+ * @param {PerformanceMonitor} monitor - The performance monitor instance used throughout the request
+ * @returns {Response} The modified response with performance metrics
  */
 function addPerformanceHeaders(response, monitor) {
   const headers = new Headers(response.headers);
   headers.set('X-Performance-Metrics', JSON.stringify(monitor.getMetrics()));
   addSecurityHeaders(headers);
-  return new Response(response.body, {
-    status: response.status,
-    headers: headers
-  });
+  return new Response(response.body, { status: response.status, headers });
 }
 
 export default {
