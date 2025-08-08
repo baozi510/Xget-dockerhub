@@ -151,7 +151,7 @@ function isMirrorDockerPath(pathname) {
   return /^\/v2\/(?!cr\/)(.+?)\/(manifests|blobs|tags)\b/.test(pathname);
 }
 
-/** 上游代理（流式转发 + 401 原样透传）——仅给 Docker 用 */
+/** 上游代理（流式转发 + 401 原样透传 + 3xx Location 重写）——仅给 Docker 用 */
 async function proxyDockerUpstream(request, upstreamUrl) {
   const upstream = await fetch(upstreamUrl, {
     method: request.method,
@@ -159,11 +159,31 @@ async function proxyDockerUpstream(request, upstreamUrl) {
     body: (request.method === 'GET' || request.method === 'HEAD') ? undefined : request.body,
     redirect: 'manual'
   });
+
+  // 1) 401：原样透传挑战头，让客户端自己去 auth.docker.io
   if (upstream.status === 401) {
     return new Response(upstream.body, { status: 401, headers: upstream.headers });
   }
-  const hdrs = addSecurityHeaders(new Headers(upstream.headers));
-  return new Response(upstream.body, { status: upstream.status, headers: hdrs });
+
+  // 2) 3xx：把 registry-1 的 Location 改回你的域名，阻止跳出镜像
+  if (upstream.status >= 300 && upstream.status < 400) {
+    const loc = upstream.headers.get('Location');
+    if (loc) {
+      const reqUrl = new URL(request.url);
+      const u = new URL(loc);
+      if (u.hostname === 'registry-1.docker.io') {
+        u.protocol = reqUrl.protocol;
+        u.host = reqUrl.host; // 回写成 hxorz.cn
+        const h = new Headers(upstream.headers);
+        h.set('Location', u.toString());
+        return new Response(null, { status: upstream.status, headers: h });
+      }
+    }
+    return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
+  }
+
+  // 3) 其余：保持原样、流式转发（不额外加头，协议更干净）
+  return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
 }
 
 /**
@@ -244,18 +264,29 @@ async function handleRequest(request, env, ctx) {
 
     // Handle container registry paths specially
     if (isDocker) {
-      // 镜像模式优先：/v2/<repo>/(manifests|blobs|tags) 直接代理 Docker Hub
+      // ① 镜像模式优先：/v2/<repo>/(manifests|blobs|tags) 直接代理 Docker Hub
       if (isMirrorDockerPath(url.pathname)) {
         const upstreamUrl = `https://registry-1.docker.io${url.pathname}${url.search}`;
         return proxyDockerUpstream(request, upstreamUrl);
       }
-      // 兼容显式模式：必须带 /cr/ 前缀
+
+      // ② 显式模式短路：/v2/cr/dockerhub/<repo>/... 或 /cr/dockerhub/<repo>/...
+      if (url.pathname.startsWith('/v2/cr/dockerhub/') || url.pathname.startsWith('/cr/dockerhub/')) {
+        const rewritten = url.pathname
+          .replace(/^\/v2\/cr\/dockerhub\//, '/v2/')
+          .replace(/^\/cr\/dockerhub\//, '/v2/');
+        const upstreamUrl = `https://registry-1.docker.io${rewritten}${url.search}`;
+        return proxyDockerUpstream(request, upstreamUrl);
+      }
+
+      // ③ 其余显式平台：必须带 /cr/ 前缀
       if (!url.pathname.startsWith('/cr/') && !url.pathname.startsWith('/v2/cr/')) {
         return new Response('container registry requests must use /cr/ prefix', {
           status: 400,
           headers: addSecurityHeaders(new Headers())
         });
       }
+
       // 显式模式下供后续解析的平台路径：移除开头的 /v2
       effectivePath = url.pathname.replace(/^\/v2/, '');
     }
